@@ -95,7 +95,7 @@
     }
   },
   "devDependencies": {
-    "@eslint/js": "^9.39.2",
+    "@eslint/js": "^10.0.1",
     "@jest/globals": "^30.4.1",
     "@sigstore/mock": "^0.13.0",
     "@types/jest": "^30.0.0",
