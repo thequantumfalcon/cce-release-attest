@@ -1,0 +1,142 @@
+name: Validate maintained attestation
+
+on:
+  workflow_dispatch:
+    inputs:
+      expected_sha:
+        description: Exact reviewed commit to validate
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: maintained-attestation-validation
+  cancel-in-progress: false
+
+jobs:
+  source:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Bind reviewed source
+        env:
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+        run: |
+          test "$GITHUB_REF" = refs/heads/main
+          test "$GITHUB_SHA" = "$EXPECTED_SHA"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .node-version
+          package-manager-cache: false
+      - name: Check locked source and bundle
+        run: |
+          set -euo pipefail
+          test "$(node --version)" = v24.21.0
+          npm ci --ignore-scripts --no-audit --no-fund
+          npm run format:check
+          npm run lint
+          npx --no-install tsc --noEmit
+          npm run ci-test -- --runInBand
+          node --test .github/validation/test_escape_tables.cjs
+          npm run package
+          node .github/validation/escape_tables.cjs dist/index.js
+          git diff --exit-code -- dist
+
+  missing-identity:
+    needs: source
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Create non-release subject
+        run: printf 'Non-release missing-identity control\n' > missing-identity.txt
+      - name: Require identity before signing
+        id: refused
+        continue-on-error: true
+        uses: ./
+        with:
+          subject-path: missing-identity.txt
+      - name: Assert refusal
+        env:
+          OUTCOME: ${{ steps.refused.outcome }}
+          BUNDLE: ${{ steps.refused.outputs.bundle-path }}
+          ATTESTATION: ${{ steps.refused.outputs.attestation-id }}
+        run: |
+          test "$OUTCOME" = failure
+          test -z "$BUNDLE"
+          test -z "$ATTESTATION"
+
+  hosted-signing:
+    needs: [source, missing-identity]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Create exact non-release subject
+        run: |
+          printf 'CCE provenance validation only\nsource=%s\nrun=%s\nattempt=%s\n' \
+            "$GITHUB_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" > validation-subject.txt
+          sha256sum validation-subject.txt > subject.sha256
+      - name: Sign test subject
+        id: attest
+        uses: ./
+        with:
+          subject-path: validation-subject.txt
+      - name: Verify identity, digest and negative control
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUNDLE_PATH: ${{ steps.attest.outputs.bundle-path }}
+        run: |
+          set -euo pipefail
+          sha256sum -c subject.sha256
+          test -s "$BUNDLE_PATH"
+          verify() {
+            gh attestation verify "$1" --bundle "$BUNDLE_PATH" \
+              --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/validate.yml" \
+              --signer-digest "$GITHUB_SHA" --source-digest "$GITHUB_SHA" \
+              --source-ref refs/heads/main --deny-self-hosted-runners --format json
+          }
+          verify validation-subject.txt > verification.json
+          cp validation-subject.txt altered-subject.txt
+          printf 'altered\n' >> altered-subject.txt
+          if verify altered-subject.txt > negative.stdout 2> negative.stderr; then
+            echo 'Altered subject was wrongly verified' >&2
+            exit 1
+          fi
+          verify validation-subject.txt > verification-after.json
+          python3 .github/validation/check_statement.py
+          cp "$BUNDLE_PATH" attestation.json
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: validation-evidence-${{ github.sha }}
+          if-no-files-found: error
+          retention-days: 30
+          path: |
+            validation-subject.txt
+            subject.sha256
+            attestation.json
+            verification.json
+            verification-after.json
+            negative.stdout
+            negative.stderr
+            statement-check.json
